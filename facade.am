@@ -246,6 +246,13 @@ public class WebPush {
         let head: string = "POST " + u.Path + " HTTP/1.1" + crlf
             + "Host: " + u.Host + crlf
             + "TTL: 86400" + crlf
+            // Urgency: high (RFC 8030 §5.3). Sans cet en-tête, FCM relaie en
+            // priorité « normal » → Android Doze met le message en file et ne
+            // le délivre qu'à la sortie de veille (la notif n'arrive qu'à la
+            // réouverture de l'appli). « high » réveille l'appareil en Doze →
+            // livraison temps réel écran verrouillé. Une notif d'alerte EST
+            // par nature urgente, donc on la pose pour tous les envois.
+            + "Urgency: high" + crlf
             + "Content-Encoding: aes128gcm" + crlf
             + "Content-Type: application/octet-stream" + crlf
             + "Content-Length: " + String_FromInt(body.Count()) + crlf
