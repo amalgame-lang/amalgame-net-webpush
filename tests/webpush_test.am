@@ -1,0 +1,44 @@
+// Vérifie l'assemblage aes128gcm Web Push (RFC 8291 + 8188) au byte près
+// contre le vecteur de test de la RFC 8291 Annexe A.
+namespace WebPushTest
+
+import Amalgame.Crypto
+import Amalgame.Net.WebPush
+import Amalgame.Collections
+import Amalgame.String
+
+public class Program {
+    public static void Main() {
+        // ── RFC 8291 Appendix A ──
+        let auth:   List<int> = Bytes.FromBase64Url("BTBZMqHH6r4Tts7J_aSIgg")
+        let uaPub:  List<int> = Bytes.FromBase64Url("BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4")
+        let asPub:  List<int> = Bytes.FromBase64Url("BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8")
+        let shared: List<int> = Bytes.FromBase64Url("kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs")
+        let salt:   List<int> = Bytes.FromBase64Url("DGv6ra1nlYgDCS1FRnbzlw")
+        let pt:     List<int> = Bytes.FromBase64Url("V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24")
+
+        var ki: List<int> = WpBytes.Concat(Bytes.FromString("WebPush: info"), WpBytes.One(0))
+        ki = WpBytes.Concat(ki, uaPub)
+        ki = WpBytes.Concat(ki, asPub)
+        let ikm: List<int> = Hkdf.Derive(auth, shared, ki, 32)
+        Program.Check("hkdf ikm (RFC 8291 A)", Bytes.ToBase64Url(ikm),
+            "S4lYMb_L0FxCeq0WhDx813KgSYqU26kOyzWUdsXYyrg")
+
+        let cek: List<int> = Hkdf.Derive(salt, ikm,
+            WpBytes.Concat(Bytes.FromString("Content-Encoding: aes128gcm"), WpBytes.One(0)), 16)
+        Program.Check("hkdf cek", Bytes.ToBase64Url(cek), "oIhVW04MRdy2XN9CiKLxTg")
+
+        let nonce: List<int> = Hkdf.Derive(salt, ikm,
+            WpBytes.Concat(Bytes.FromString("Content-Encoding: nonce"), WpBytes.One(0)), 12)
+        Program.Check("hkdf nonce", Bytes.ToBase64Url(nonce), "4h_95klXJ5E_qnoN")
+
+        let body: List<int> = WebPush.EncodeBody(pt, uaPub, asPub, auth, shared, salt)
+        Program.Check("aes128gcm body (RFC 8291 A)", Bytes.ToBase64Url(body),
+            "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN")
+    }
+
+    static void Check(string name, string got, string exp) {
+        if (got == exp) { Console.WriteLine("[PASS] " + name) }
+        else { Console.WriteLine("[FAIL] " + name + " got=" + got) }
+    }
+}
