@@ -1,0 +1,294 @@
+// amalgame-net-webpush — Web Push (RFC 8030 / 8291 / 8292) sender.
+//
+// Chiffre et POST un message Web Push vers l'endpoint d'un abonné :
+//   - chiffrement de contenu **aes128gcm** (RFC 8188) avec dérivation de
+//     clé Web Push (RFC 8291) — ECDH P-256 + HKDF-SHA256 + AES-128-GCM ;
+//   - authentification **VAPID** (RFC 8292) — JWT ES256 ;
+//   - POST HTTPS **binaire** (helper @c — net-http ne POST que des string
+//     NUL-tronquées ; le corps chiffré est binaire).
+//
+// HKDF-SHA256 est en Amalgame pur (au-dessus de Crypto.Hmac.Sha256). La
+// frontière FFI (@c) se limite au socket/TLS du POST binaire. Tout le reste
+// (dérivations, assemblage du corps, JWT) est en Amalgame, testé au byte
+// près contre le vecteur RFC 8291 Annexe A.
+
+namespace Amalgame.Net.WebPush
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+
+@c {
+    #include "Amalgame_Tls.h"
+    #include <stdio.h>
+    #include <string.h>
+    #include <stdlib.h>
+    #ifndef _WIN32
+      #include <sys/socket.h>
+    #endif
+    #include <openssl/rand.h>
+
+    static uint8_t* amwp_list_to_bytes(AmalgameList* l, size_t* out_len) {
+        if (!l) { *out_len = 0; return NULL; }
+        int n = AmalgameList_size(l);
+        uint8_t* b = (uint8_t*) GC_MALLOC_ATOMIC(n > 0 ? n : 1);
+        for (int i = 0; i < n; i++) b[i] = (uint8_t)(intptr_t) AmalgameList_get(l, i);
+        *out_len = (size_t) n;
+        return b;
+    }
+
+    // POST binaire : head (string) + corps binaire, sur fd (TLS si isTls).
+    // Renvoie le code de statut HTTP, ou un négatif en cas d'erreur réseau.
+    static int amwp_post(int fd, int isTls, const char* host, const char* head, AmalgameList* bodyList) {
+        size_t blen; uint8_t* body = amwp_list_to_bytes(bodyList, &blen);
+        AmalgameTlsStream* st = NULL;
+        if (isTls) {
+            AmalgameTlsConfig* cfg = Amalgame_Tls_TlsConfig_Default();
+            cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
+            AmalgameTlsContext* ctx = _amtls_new_ctx(cfg, false);
+            if (!ctx || !ctx->_ctx) return -2;
+            st = Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
+            if (st && st->_ssl && host) SSL_set_tlsext_host_name((SSL*) st->_ssl, host);
+            if (!st || !Amalgame_Tls_TlsStream_Handshake(st)) {
+                if (st) Amalgame_Tls_TlsStream_Close(st);
+                return -3;
+            }
+        }
+        size_t hlen = head ? strlen(head) : 0;
+        i64 wn;
+        if (st) { wn = Amalgame_Tls_TlsStream_WriteBytes(st, (char*) head, (i64) hlen); }
+        else    { wn = (i64) send(fd, head, hlen, 0); }
+        if (wn >= 0 && blen > 0) {
+            if (st) { wn = Amalgame_Tls_TlsStream_WriteBytes(st, (char*) body, (i64) blen); }
+            else    { wn = (i64) send(fd, body, blen, 0); }
+        }
+        if (wn < 0) { if (st) Amalgame_Tls_TlsStream_Close(st); return -4; }
+        // Lit le début de la réponse pour la ligne de statut.
+        char buf[2048]; int got = 0;
+        while (got < (int) sizeof(buf) - 1) {
+            i64 rn;
+            if (st) { rn = Amalgame_Tls_TlsStream_ReadBytes(st, buf + got, (i64)(sizeof(buf) - 1 - got)); }
+            else    { rn = (i64) recv(fd, buf + got, sizeof(buf) - 1 - got, 0); }
+            if (rn <= 0) break;
+            got += (int) rn;
+            if (strstr(buf, "\r\n")) break;   // on a la ligne de statut
+        }
+        buf[got] = 0;
+        int status = -5;
+        { char* sp = strchr(buf, ' '); if (sp) status = atoi(sp + 1); }
+        if (st) Amalgame_Tls_TlsStream_Close(st);
+        return status;
+    }
+
+    static AmalgameList* amwp_rand16(void) {
+        uint8_t s[16];
+        if (RAND_bytes(s, 16) != 1) { return AmalgameList_newWithCapacity(0); }
+        AmalgameList* out = AmalgameList_newWithCapacity(16);
+        for (int i = 0; i < 16; i++) AmalgameList_add(out, (void*)(intptr_t)(unsigned int) s[i]);
+        return out;
+    }
+
+    static i64 amwp_now(void) { return (i64) time(NULL); }
+}
+
+// ── Utilitaires octets ───────────────────────────────────────────────
+public class WpBytes {
+    public static List<int> One(int b) { let l = new List<int>(); l.Add(b); return l }
+    public static List<int> Concat(List<int> a, List<int> b) {
+        let out = new List<int>()
+        for i in 0..a.Count() { out.Add(a.Get(i)) }
+        for i in 0..b.Count() { out.Add(b.Get(i)) }
+        return out
+    }
+    public static List<int> Slice(List<int> a, int off, int len) {
+        let out = new List<int>()
+        var i: int = off
+        let end: int = off + len
+        while (i < end && i < a.Count()) { out.Add(a.Get(i)); i = i + 1 }
+        return out
+    }
+    // Entier non signé sur 4 octets big-endian.
+    public static List<int> U32be(int n) {
+        let out = new List<int>()
+        out.Add((n / 16777216) % 256)
+        out.Add((n / 65536) % 256)
+        out.Add((n / 256) % 256)
+        out.Add(n % 256)
+        return out
+    }
+    public static List<int> Rand16() {
+        var out: List<int> = new List<int>()
+        @c { out = amwp_rand16(); }
+        return out
+    }
+    public static int NowSecs() {
+        var t: int = 0
+        @c { t = (int64_t) amwp_now(); }
+        return t
+    }
+}
+
+// ── HKDF-SHA256 (RFC 5869), AM pur sur Crypto.Hmac.Sha256 ─────────────
+// len <= 32 → un seul bloc d'expansion (T(1)) suffit, ce qui couvre tous
+// les besoins Web Push (IKM=32, CEK=16, NONCE=12).
+public class Hkdf {
+    public static List<int> Derive(List<int> salt, List<int> ikm, List<int> info, int len) {
+        let prk: List<int> = Hmac.Sha256(salt, ikm)                 // extract
+        let t1: List<int> = Hmac.Sha256(prk, WpBytes.Concat(info, WpBytes.One(1)))  // expand T(1)
+        return WpBytes.Slice(t1, 0, len)
+    }
+}
+
+// ── Abonnement Web Push (du PushSubscription du navigateur) ──────────
+public class PushSubscription {
+    public Endpoint: string
+    public P256dh:   string   // clé publique de l'abonné, base64url (65 o)
+    public Auth:     string   // secret d'auth, base64url (16 o)
+    public PushSubscription(endpoint: string, p256dh: string, auth: string) {
+        this.Endpoint = endpoint; this.P256dh = p256dh; this.Auth = auth
+    }
+}
+
+public class WebPushResult {
+    public StatusCode: int
+    public Ok:         bool
+    public WebPushResult(status: int) {
+        this.StatusCode = status
+        this.Ok = status >= 200 && status < 300
+    }
+}
+
+// ── URL minimale (scheme/host/port/path) ─────────────────────────────
+public class WpUrl {
+    public Scheme: string
+    public Host:   string
+    public Port:   int
+    public Path:   string
+    public IsTls:  bool
+    public WpUrl() { this.Scheme = ""; this.Host = ""; this.Port = 0; this.Path = "/"; this.IsTls = false }
+    public static WpUrl Parse(string url) {
+        let u = new WpUrl()
+        let sep: int = String_IndexOf(url, "://")
+        if (sep < 0) { return null }
+        u.Scheme = String_Substring(url, 0, sep)
+        u.IsTls = u.Scheme == "https"
+        let rest: string = String_Substring(url, sep + 3, String_Length(url) - sep - 3)
+        let slash: int = String_IndexOf(rest, "/")
+        var hostPort: string = rest
+        if (slash < 0) { u.Path = "/" }
+        else { hostPort = String_Substring(rest, 0, slash); u.Path = String_Substring(rest, slash, String_Length(rest) - slash) }
+        let colon: int = String_IndexOf(hostPort, ":")
+        if (colon < 0) { u.Host = hostPort }
+        else {
+            u.Host = String_Substring(hostPort, 0, colon)
+            u.Port = String_ToInt(String_Substring(hostPort, colon + 1, String_Length(hostPort) - colon - 1))
+        }
+        return u
+    }
+    public static string OriginOf(string url) {
+        let u: WpUrl = WpUrl.Parse(url)
+        if (u == null) { return "" }
+        return u.Scheme + "://" + u.Host
+    }
+}
+
+public class WebPush {
+    // ── Assemblage aes128gcm (RFC 8291 + 8188), DÉTERMINISTE et testable.
+    // Entrées toutes connues (au test : vecteur RFC 8291 Annexe A) :
+    //   plaintext, uaPub(65), asPub(65), authSecret(16), shared(32), salt(16)
+    // Renvoie le corps Web Push complet : salt || rs(4) || idlen(1) || asPub
+    //   || AES-128-GCM(cek, nonce, "", plaintext || 0x02).
+    public static List<int> EncodeBody(List<int> plaintext, List<int> uaPub, List<int> asPub,
+            List<int> authSecret, List<int> shared, List<int> salt) {
+        // ikm = HKDF(auth, shared, "WebPush: info"||0x00||uaPub||asPub, 32)
+        var keyInfo: List<int> = WpBytes.Concat(Bytes.FromString("WebPush: info"), WpBytes.One(0))
+        keyInfo = WpBytes.Concat(keyInfo, uaPub)
+        keyInfo = WpBytes.Concat(keyInfo, asPub)
+        let ikm: List<int> = Hkdf.Derive(authSecret, shared, keyInfo, 32)
+        // RFC 8188 : CEK / NONCE depuis (salt, ikm)
+        let cekInfo: List<int> = WpBytes.Concat(Bytes.FromString("Content-Encoding: aes128gcm"), WpBytes.One(0))
+        let nonceInfo: List<int> = WpBytes.Concat(Bytes.FromString("Content-Encoding: nonce"), WpBytes.One(0))
+        let cek: List<int> = Hkdf.Derive(salt, ikm, cekInfo, 16)
+        let nonce: List<int> = Hkdf.Derive(salt, ikm, nonceInfo, 12)
+        // plaintext || 0x02 (délimiteur de dernier enregistrement, RFC 8188)
+        let padded: List<int> = WpBytes.Concat(plaintext, WpBytes.One(2))
+        let ct: List<int> = Aead.SealAes128Gcm(cek, nonce, new List<int>(), padded)
+        // En-tête : salt(16) || rs(4 BE) || idlen(1) || keyid(asPub)
+        var body: List<int> = WpBytes.Concat(salt, WpBytes.U32be(4096))
+        body = WpBytes.Concat(body, WpBytes.One(asPub.Count()))
+        body = WpBytes.Concat(body, asPub)
+        body = WpBytes.Concat(body, ct)
+        return body
+    }
+
+    // VAPID JWT (RFC 8292) : header ES256 + claims {aud, exp, sub},
+    // signé avec la clé privée VAPID (PEM). exp = maintenant + 12 h.
+    public static string VapidJwt(string vapidPrivPem, string audience, string subject) {
+        let header: string = "{\"typ\":\"JWT\",\"alg\":\"ES256\"}"
+        let exp: int = WpBytes.NowSecs() + 43200
+        let claims: string = "{\"aud\":\"" + audience + "\",\"exp\":" + String_FromInt(exp)
+            + ",\"sub\":\"" + subject + "\"}"
+        let hB64: string = Bytes.ToBase64Url(Bytes.FromString(header))
+        let cB64: string = Bytes.ToBase64Url(Bytes.FromString(claims))
+        let signingInput: string = hB64 + "." + cB64
+        let key: JwsKey = JwsKey.FromPemPrivate(vapidPrivPem)
+        let sig: List<int> = key.Sign(Bytes.FromString(signingInput))   // raw R||S (64 o)
+        return signingInput + "." + Bytes.ToBase64Url(sig)
+    }
+
+    // POST binaire du corps chiffré vers l'endpoint, en-tête Authorization VAPID.
+    public static int PostBinary(string url, List<int> body, string authHeader) {
+        let u: WpUrl = WpUrl.Parse(url)
+        if (u == null || String_Length(u.Host) == 0) { return -1 }
+        var port: int = u.Port
+        if (port == 0) { if (u.IsTls) { port = 443 } else { port = 80 } }
+        let crlf: string = String_FromByte(13) + "\n"
+        let head: string = "POST " + u.Path + " HTTP/1.1" + crlf
+            + "Host: " + u.Host + crlf
+            + "TTL: 86400" + crlf
+            + "Content-Encoding: aes128gcm" + crlf
+            + "Content-Type: application/octet-stream" + crlf
+            + "Content-Length: " + String_FromInt(body.Count()) + crlf
+            + "Authorization: " + authHeader + crlf
+            + "Connection: close" + crlf + crlf
+        let conn = TcpClient_Connect(u.Host, port)
+        if (!TcpClient_IsConnected(conn)) { return -2 }
+        var status: int = -3
+        var tlsFlag: int = 0
+        if (u.IsTls) { tlsFlag = 1 }
+        let hostC: string = u.Host
+        let headC: string = head
+        @c {
+            int fd = conn ? conn->_fd : -1;
+            status = amwp_post(fd, (int) tlsFlag, (const char*) hostC, (const char*) headC, body);
+        }
+        TcpClient_Close(conn)
+        return status
+    }
+
+    // Envoi complet : chiffre `payload` pour l'abonné + VAPID + POST.
+    //   sub            — l'abonnement (endpoint + p256dh + auth)
+    //   payload        — le texte (souvent du JSON) à pousser
+    //   vapidPrivPem   — clé privée VAPID (PEM PKCS#8, ES256)
+    //   vapidPubB64    — clé publique VAPID base64url (65 o) pour l'en-tête
+    //   subject        — "mailto:…" ou l'URL du site (RFC 8292)
+    public static WebPushResult Send(PushSubscription sub, string payload,
+            string vapidPrivPem, string vapidPubB64, string subject) {
+        let uaPub: List<int> = Bytes.FromBase64Url(sub.P256dh)
+        let authSecret: List<int> = Bytes.FromBase64Url(sub.Auth)
+        if (uaPub.Count() != 65 || authSecret.Count() != 16) { return new WebPushResult(-10) }
+        let eph: Ecdh = Ecdh.GenerateP256()
+        if (!eph.IsValid()) { return new WebPushResult(-11) }
+        let asPub: List<int> = eph.PublicRaw()
+        let shared: List<int> = eph.Derive(uaPub)
+        if (shared.Count() != 32) { return new WebPushResult(-12) }
+        let salt: List<int> = WpBytes.Rand16()
+        if (salt.Count() != 16) { return new WebPushResult(-13) }
+        let body: List<int> = WebPush.EncodeBody(Bytes.FromString(payload), uaPub, asPub, authSecret, shared, salt)
+        let aud: string = WpUrl.OriginOf(sub.Endpoint)
+        let jwt: string = WebPush.VapidJwt(vapidPrivPem, aud, subject)
+        let authHeader: string = "vapid t=" + jwt + ", k=" + vapidPubB64
+        let status: int = WebPush.PostBinary(sub.Endpoint, body, authHeader)
+        return new WebPushResult(status)
+    }
+}

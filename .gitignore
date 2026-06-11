@@ -1,0 +1,4 @@
+/build/
+/*.c
+/test
+amalgame.lock
