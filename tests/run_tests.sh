@@ -39,11 +39,20 @@ PKGDIR="${AMALGAME_PACKAGES_DIR:-$HOME/.amalgame/packages}/github.com/amalgame-l
 CR="$(ls -d "$PKGDIR"/amalgame-crypto/v0.8.0_*/ 2>/dev/null | head -1)"
 TLS="$(ls -d "$PKGDIR"/amalgame-tls/*/ 2>/dev/null | sort -V | tail -1)"
 [ -n "$CR" ] && [ -n "$TLS" ] || { echo "ERROR: crypto/tls not in cache after package add." >&2; exit 2; }
-CRARCH="$(ls "${CR}build/linux-x86_64/"libamalgame-pkg-*.a 2>/dev/null | head -1)"
-TLSARCH="$(ls "${TLS}build/linux-x86_64/"libamalgame-pkg-*.a 2>/dev/null | head -1)"
 
-# ── Build test (crypto/tls via lock; facade as renamed source) ──
+# ── Build crypto facade → .o ───────────────────────────
+# The package archives (build/linux-x86_64/*.a) are gitignored, so they're
+# absent after a fresh `package add` in CI. Crypto's facade is pure-AM @c
+# (OpenSSL), so we compile it ourselves to a .o (webauthn's pattern).
+# TLS needs NO archive: the Amalgame_Tls_* primitives webpush calls are
+# `static inline` in Amalgame_Tls.h — header-only, satisfied by -lssl.
 TMP="$(mktemp -d)"
+( cd "$CR" && "$AMC" --lib -o "$TMP/crypto" facade.am ) >/dev/null 2>&1 \
+    || { echo "crypto facade amc compile failed"; exit 1; }
+gcc -O2 -I"$AMC_RUNTIME" -I"${CR}runtime" -I"$CR" -w -c "$TMP/crypto.c" -o "$TMP/crypto.o" \
+    || { echo "crypto.o build failed"; exit 1; }
+
+# ── Build test (crypto via .o; facade as renamed source) ──
 cp "$PKG/facade.am" "$TMP/wp_src.am"
 cp "$PKG/tests/webpush_test.am" "$TMP/wp_main.am"
 sed -i 's/public static void Main()/public static int Main(string[] args)/' "$TMP/wp_main.am"
@@ -53,7 +62,7 @@ perl -0pi -e 's/(Qulcy4a-fN"\)\n)(    \})/$1        return 0\n$2/' "$TMP/wp_main
 echo "── Compiling + linking the RFC 8291 vector test ──"
 "$AMC" "$TMP/wp_main.am" "$TMP/wp_src.am" -o "$TMP/test" --quiet || { echo "amc compile failed"; exit 1; }
 gcc -O2 -I"$AMC_RUNTIME" -I"${TLS}runtime" -I"${CR}runtime" -w "$TMP/test.c" \
-    "$CRARCH" "$TLSARCH" "$LIBA" -lgc -lm -lcrypto -lssl -o "$TMP/test" \
+    "$TMP/crypto.o" "$LIBA" -lgc -lm -lcrypto -lssl -o "$TMP/test" \
     || { echo "gcc link failed"; exit 1; }
 
 echo ""
