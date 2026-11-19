@@ -32,6 +32,11 @@ public class Program {
             WpBytes.Concat(Bytes.FromString("Content-Encoding: nonce"), WpBytes.One(0)), 12)
         Program.Check("hkdf nonce", Bytes.ToBase64Url(nonce), "4h_95klXJ5E_qnoN")
 
+        // VAPID audience (RFC 8292) : the origin, with a non-default port.
+        Program.Check("origin https", WpUrl.OriginOf("https://fcm.googleapis.com/fcm/send/abc"), "https://fcm.googleapis.com")
+        Program.Check("origin https:443", WpUrl.OriginOf("https://push.example:443/x"), "https://push.example")
+        Program.Check("origin with port", WpUrl.OriginOf("http://127.0.0.1:8080/push/d1"), "http://127.0.0.1:8080")
+
         let body: List<int> = WebPush.EncodeBody(pt, uaPub, asPub, auth, shared, salt)
         Program.Check("aes128gcm body (RFC 8291 A)", Bytes.ToBase64Url(body),
             "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN")

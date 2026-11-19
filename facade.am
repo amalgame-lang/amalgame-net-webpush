@@ -188,7 +188,11 @@ public class WpUrl {
     public static string OriginOf(string url) {
         let u: WpUrl = WpUrl.Parse(url)
         if (u == null) { return "" }
-        return u.Scheme + "://" + u.Host
+        // RFC 8292 : the audience is the push resource's origin, with its
+        // port when it is not the scheme's default (RFC 6454).
+        let def: bool = u.Port == 0 || (u.IsTls && u.Port == 443) || (!u.IsTls && u.Port == 80)
+        if (def) { return u.Scheme + "://" + u.Host }
+        return u.Scheme + "://" + u.Host + ":" + String_FromInt(u.Port)
     }
 }
 
