@@ -68,6 +68,91 @@ gcc -O2 -I"$AMC_RUNTIME" -I"${TLS}runtime" -I"${CR}runtime" -w "$TMP/test.c" \
 echo ""
 OUT="$("$TMP/test")"
 echo "$OUT" | sed 's/^/  /'
+
+# ── v0.1.3 : the push service's certificate name is checked ──
+# A fake push service (Python ssl) answers 201 and records the requests ;
+# a throwaway CA is trusted through SSL_CERT_FILE. OLD_FACADE=<older
+# facade.am>, when given, runs the wrong-name case on it as a witness.
+if command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    echo ""
+    echo "── TLS : certificate of the push service ──"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout "$TMP/ca.key" -out "$TMP/ca.crt" -subj "/CN=Test CA" >/dev/null 2>&1
+    for spec in "localhost DNS:localhost" "other DNS:push.other.test" "ip IP:127.0.0.1"; do
+        set -- $spec
+        openssl req -newkey rsa:2048 -nodes -keyout "$TMP/$1.key" -out "$TMP/$1.csr" -subj "/CN=$1" >/dev/null 2>&1
+        printf "subjectAltName=%s\n" "$2" > "$TMP/$1.ext"
+        openssl x509 -req -in "$TMP/$1.csr" -CA "$TMP/ca.crt" -CAkey "$TMP/ca.key" -CAcreateserial -days 1 \
+            -extfile "$TMP/$1.ext" -out "$TMP/$1.crt" >/dev/null 2>&1
+    done
+    cat > "$TMP/push.py" <<'PY'
+import socket, ssl, sys
+port, cert, key, log = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.listen(8)
+while True:
+    c, _ = s.accept()
+    try:
+        t = ctx.wrap_socket(c, server_side=True)
+        data = b""
+        while b"\r\n\r\n" not in data:           # the headers, then the whole body
+            chunk = t.recv(65536)
+            if not chunk: break
+            data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        n = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"): n = int(line.split(b":")[1])
+        while len(body) < n:
+            chunk = t.recv(65536)
+            if not chunk: break
+            body += chunk
+        open(log, "ab").write(head + b"\r\n\r\n" + body)
+        t.sendall(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        t.close()
+    except Exception:
+        c.close()
+PY
+    WPIDS=""
+    for spec in "18481 localhost" "18482 other" "18483 ip"; do
+        set -- $spec
+        python3 "$TMP/push.py" "$1" "$TMP/$2.crt" "$TMP/$2.key" "$TMP/push-$1.log" >/dev/null 2>&1 &
+        WPIDS="$WPIDS $!"
+    done
+    sleep 1
+    build_tls() {  # facade.am out
+        cp "$1" "$TMP/tv_src.am"; cp "$PKG/tests/tls_verify.am" "$TMP/tv_main.am"
+        "$AMC" "$TMP/tv_main.am" "$TMP/tv_src.am" -o "$2" --quiet >/dev/null 2>&1 || return 1
+        gcc -O2 -I"$AMC_RUNTIME" -I"${TLS}runtime" -I"${CR}runtime" -w "$2.c" \
+            "$TMP/crypto.o" "$LIBA" -lgc -lm -lcrypto -lssl -o "$2"
+    }
+    TFAIL=0
+    tcheck() {  # label expect url
+        local o; o="$(SSL_CERT_FILE="$TMP/ca.crt" WP_URL="$3" "$TMP/tv" 2>&1)"; local rc=$?; [ $rc = 0 ] || o="$o (exit $rc)"
+        if [ "$o" = "status=$2" ]; then echo "  [PASS] $1"; else echo "  [FAIL] $1 : $o"; TFAIL=1; fi
+    }
+    if build_tls "$PKG/facade.am" "$TMP/tv"; then
+        tcheck "bon nom (localhost) : envoyé (201)" 201 "https://localhost:18481/push/abc"
+        tcheck "certificat valide d'un autre nom : refusé (-3)" -3 "https://localhost:18482/push/abc"
+        [ -s "$TMP/push-18482.log" ] && { echo "  [FAIL] l'imposteur a reçu la requête"; TFAIL=1; } \
+            || echo "  [PASS] l'imposteur n'a rien reçu (ni en-tête VAPID ni message)"
+        tcheck "adresse IP, certificat IP:127.0.0.1 : envoyé (201)" 201 "https://127.0.0.1:18483/push/abc"
+        tcheck "adresse IP, certificat DNS seulement : refusé (-3)" -3 "https://127.0.0.1:18481/push/abc"
+    else
+        echo "  [FAIL] build of tests/tls_verify.am"; TFAIL=1
+    fi
+    if [ -s "${OLD_FACADE:-}" ] && build_tls "$OLD_FACADE" "$TMP/tv_old"; then
+        rm -f "$TMP/push-18482.log"
+        o="$(SSL_CERT_FILE="$TMP/ca.crt" WP_URL=https://localhost:18482/push/abc "$TMP/tv_old")"
+        got=$(grep -c "Authorization: vapid" "$TMP/push-18482.log" 2>/dev/null || true)
+        echo "  [TÉMOIN] version précédente, certificat d'un autre nom : $o ; en-tête VAPID reçu par l'imposteur : $([ "${got:-0}" -gt 0 ] && echo OUI || echo non)"
+    fi
+    for p in $WPIDS; do kill "$p" 2>/dev/null; done
+    [ "$TFAIL" = 0 ] || OUT="$OUT
+[FAIL] TLS"
+    OUT="$OUT
+$( [ "$TFAIL" = 0 ] && echo '[PASS] TLS : nom du service vérifié')"
+fi
 rm -rf "$TMP"
 echo ""
 if echo "$OUT" | grep -q '\[FAIL\]'; then

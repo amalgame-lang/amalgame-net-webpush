@@ -27,6 +27,51 @@ import Amalgame.Crypto
       #include <sys/socket.h>
     #endif
     #include <openssl/rand.h>
+    #include <openssl/x509v3.h>
+    #include <errno.h>
+    #include <signal.h>
+    #ifndef _WIN32
+      #include <arpa/inet.h>
+      #include <sys/time.h>
+    #endif
+
+    /* v0.1.3 — the push service's NAME is checked, not only its chain.
+     * Until v0.1.2 the certificate had to chain to a trusted CA but could be
+     * issued for any name : whoever stood on the path with any valid
+     * certificate could pose as the push service and swallow the alerts
+     * (the payload stays end-to-end encrypted, RFC 8291, but it never
+     * reaches the phone). DNS name : SSL_set1_host (no partial wildcards) ;
+     * IP literal : the certificate's IP SAN. */
+    static int amwp_pin_host(SSL* ssl, const char* host) {
+        if (!ssl || !host || !host[0]) return 0;
+        unsigned char ipbuf[16];
+        if (inet_pton(AF_INET, host, ipbuf) == 1 || inet_pton(AF_INET6, host, ipbuf) == 1)
+            return X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host) == 1;
+        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        return SSL_set1_host(ssl, host) == 1;
+    }
+    /* 1 = a signal interrupted the call (GC stop-the-world) : do it again. */
+    static int amwp_interrupted(void) {
+        #ifdef _WIN32
+        return WSAGetLastError() == WSAEINTR;
+        #else
+        return errno == EINTR;
+        #endif
+    }
+    /* v0.1.3 — 15 s of silence and the send gives up (a push service that
+     * says nothing must not hold the alert sender for ever). */
+    static void amwp_timeout(int fd) {
+        if (fd < 0) return;
+        #ifdef _WIN32
+        DWORD t = 15000;
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &t, sizeof(t));
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_SNDTIMEO, (const char*) &t, sizeof(t));
+        #else
+        struct timeval tv = { 15, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        #endif
+    }
 
     static uint8_t* amwp_list_to_bytes(AmalgameList* l, size_t* out_len) {
         if (!l) { *out_len = 0; return NULL; }
@@ -42,6 +87,13 @@ import Amalgame.Crypto
     static int amwp_post(int fd, int isTls, const char* host, const char* head, AmalgameList* bodyList) {
         size_t blen; uint8_t* body = amwp_list_to_bytes(bodyList, &blen);
         AmalgameTlsStream* st = NULL;
+        amwp_timeout(fd);
+        #ifndef _WIN32
+        /* v0.1.3 : a service that answers and closes before the whole body
+         * is written must fail the write (EPIPE), not kill the process with
+         * SIGPIPE — same rule as amalgame-net-http's servers. */
+        signal(SIGPIPE, SIG_IGN);
+        #endif
         if (isTls) {
             AmalgameTlsConfig* cfg = Amalgame_Tls_TlsConfig_Default();
             cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
@@ -49,26 +101,44 @@ import Amalgame.Crypto
             if (!ctx || !ctx->_ctx) return -2;
             st = Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
             if (st && st->_ssl && host) SSL_set_tlsext_host_name((SSL*) st->_ssl, host);
-            if (!st || !Amalgame_Tls_TlsStream_Handshake(st)) {
+            int hs = 0;
+            if (st && st->_ssl && amwp_pin_host((SSL*) st->_ssl, host)) {
+                for (int tries = 0; tries < 20 && !hs; tries++) {
+                    errno = 0;
+                    hs = Amalgame_Tls_TlsStream_Handshake(st) ? 1 : 0;
+                    if (!hs && !amwp_interrupted()) break;
+                }
+            }
+            if (!hs) {
                 if (st) Amalgame_Tls_TlsStream_Close(st);
-                return -3;
+                return -3;   /* handshake failed, or certificate not valid for `host` */
             }
         }
         size_t hlen = head ? strlen(head) : 0;
         i64 wn;
-        if (st) { wn = Amalgame_Tls_TlsStream_WriteBytes(st, (char*) head, (i64) hlen); }
-        else    { wn = (i64) send(fd, head, hlen, 0); }
+        for (int tries = 0; tries < 20; tries++) {   /* v0.1.3 : again after a signal */
+            errno = 0;
+            if (st) { wn = Amalgame_Tls_TlsStream_WriteBytes(st, (char*) head, (i64) hlen); }
+            else    { wn = (i64) send(fd, head, hlen, 0); }
+            if (wn >= 0 || !amwp_interrupted()) break;
+        }
         if (wn >= 0 && blen > 0) {
-            if (st) { wn = Amalgame_Tls_TlsStream_WriteBytes(st, (char*) body, (i64) blen); }
-            else    { wn = (i64) send(fd, body, blen, 0); }
+            for (int tries = 0; tries < 20; tries++) {
+                errno = 0;
+                if (st) { wn = Amalgame_Tls_TlsStream_WriteBytes(st, (char*) body, (i64) blen); }
+                else    { wn = (i64) send(fd, body, blen, 0); }
+                if (wn >= 0 || !amwp_interrupted()) break;
+            }
         }
         if (wn < 0) { if (st) Amalgame_Tls_TlsStream_Close(st); return -4; }
         // Lit le début de la réponse pour la ligne de statut.
         char buf[2048]; int got = 0;
         while (got < (int) sizeof(buf) - 1) {
             i64 rn;
+            errno = 0;
             if (st) { rn = Amalgame_Tls_TlsStream_ReadBytes(st, buf + got, (i64)(sizeof(buf) - 1 - got)); }
             else    { rn = (i64) recv(fd, buf + got, sizeof(buf) - 1 - got, 0); }
+            if (rn < 0 && amwp_interrupted()) continue;   /* v0.1.3 : a GC signal is not the end */
             if (rn <= 0) break;
             got += (int) rn;
             if (strstr(buf, "\r\n")) break;   // on a la ligne de statut

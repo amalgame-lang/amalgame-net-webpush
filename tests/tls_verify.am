@@ -1,0 +1,25 @@
+// TLS check of the POST to the push service (v0.1.3), driven by
+// tests/run_tests.sh against a fake push service : WP_URL is posted to,
+// the HTTP status (or a negative network error) is printed.
+//   status=201  the service was reached
+//   status=-3   the TLS handshake was refused (certificate not valid for the host)
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+
+@c {
+    #include <stdlib.h>
+    static const char* wpt_env(const char* k) { const char* v = getenv(k); return v ? v : ""; }
+}
+
+public class Program {
+    public static int Main(string[] args) {
+        var url: string = ""
+        @c { url = (code_string) wpt_env("WP_URL"); }
+        let body: List<int> = WpBytes.One(65)
+        let st: int = WebPush.PostBinary(url, body, "vapid t=x, k=y")
+        Console.WriteLine("status=" + String_FromInt(st))
+        return 0
+    }
+}

@@ -13,7 +13,12 @@ let res = WebPush.Send(sub, "{\"title\":\"…\"}", vapidPrivPem, vapidPubB64, "m
 - **aes128gcm** content-encoding (RFC 8188) + Web Push key derivation
   (RFC 8291: ephemeral ECDH P-256 + HKDF-SHA256 + AES-128-GCM).
 - **VAPID** auth (RFC 8292, ES256 JWT).
-- Binary HTTPS POST of the encrypted body.
+- Binary HTTPS POST of the encrypted body. The push service's certificate
+  must chain to a CA of the system store **and** be issued for the
+  endpoint's host (since v0.1.3 — before, any valid certificate for another
+  name was accepted, so an impostor on the path could swallow the
+  notifications). A refused certificate gives `StatusCode` -3 ; 15 s of
+  silence gives up the send.
 
 HKDF-SHA256 is pure-Amalgame over `amalgame-crypto`'s `Hmac.Sha256`; the only
 FFI is the binary HTTPS POST. The encryption assembly is verified

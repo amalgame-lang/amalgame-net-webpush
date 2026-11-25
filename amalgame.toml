@@ -1,9 +1,9 @@
 
 [package]
 name = "amalgame-net-webpush"
-version = "0.1.2"
+version = "0.1.3"
 license = "Apache-2.0"
-description = "Web Push sender (RFC 8030/8291/8292) for the Mosaic stack. WebPush.Send(subscription, payload, vapidPrivatePem, vapidPublicB64url, subject) encrypts the payload with the aes128gcm content-encoding (RFC 8188) + Web Push key derivation (RFC 8291: ephemeral ECDH P-256 with the subscriber's p256dh key, HKDF-SHA256, AES-128-GCM), signs a VAPID JWT (RFC 8292, ES256), and POSTs the binary body to the push service over HTTPS. HKDF-SHA256 is pure-Amalgame over crypto's Hmac.Sha256; the only FFI is the binary HTTPS POST (net-http only posts NUL-truncated strings, and the encrypted body is binary). The aes128gcm assembly (IKM/PRK/CEK/NONCE + record header salt||rs||idlen||keyid) is verified BYTE-EXACT against the RFC 8291 Appendix A test vector. Lets a server push notifications to a subscribed PWA even when it's closed."
+description = "Web Push sender (RFC 8030/8291/8292) for the Mosaic stack. WebPush.Send(subscription, payload, vapidPrivatePem, vapidPublicB64url, subject) encrypts the payload with the aes128gcm content-encoding (RFC 8188) + Web Push key derivation (RFC 8291: ephemeral ECDH P-256 with the subscriber's p256dh key, HKDF-SHA256, AES-128-GCM), signs a VAPID JWT (RFC 8292, ES256), and POSTs the binary body to the push service over HTTPS. HKDF-SHA256 is pure-Amalgame over crypto's Hmac.Sha256; the only FFI is the binary HTTPS POST (net-http only posts NUL-truncated strings, and the encrypted body is binary). The aes128gcm assembly (IKM/PRK/CEK/NONCE + record header salt||rs||idlen||keyid) is verified BYTE-EXACT against the RFC 8291 Appendix A test vector. Lets a server push notifications to a subscribed PWA even when it's closed. v0.1.3: the push service's certificate must be issued for the endpoint host (before, the chain alone was checked and an impostor with any valid certificate could swallow the notifications) ; 15 s timeout ; I/O restarted after GC signals ; SIGPIPE ignored."
 authors = ["Bastien Mouget"]
 required-amalgame = ">=0.8.58"
 schema-version = 1
